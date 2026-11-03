@@ -66,7 +66,8 @@ def condition_setups() -> dict:
 
 
 # (challenger, opponent) pairs for pairwise judging, when both conditions ran.
-PAIRS = [("skill", "baseline"), ("skill", "concise"), ("plugin", "baseline"), ("pointer", "baseline")]
+PAIRS = [("skill", "baseline"), ("skill", "concise"), ("plugin", "baseline"),
+         ("pointer", "baseline"), ("pointer", "concise")]
 
 FILLER = re.compile(
     r"\b(great question|good question|certainly!|of course!|i hope this helps|"
@@ -75,8 +76,9 @@ FILLER = re.compile(
 )
 
 
-def load_cases() -> list:
-    return [json.loads(line) for line in CASES_FILE.read_text().splitlines() if line.strip()]
+def load_cases(path=None) -> list:
+    path = Path(path) if path else CASES_FILE
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 def read_jsonl(path: Path) -> list:
@@ -283,12 +285,12 @@ def stop_at_gate(run_dir: Path, stage: str, gate: UsageGate) -> None:
 
 def generate(args, backend, gate, run_dir: Path) -> None:
     setups = condition_setups()
-    cases = load_cases()
+    cases = load_cases(args.cases_file)
     if args.cases:
         wanted = set(args.cases.split(","))
         cases = [c for c in cases if c["id"] in wanted or c["maxim"] in wanted]
     jobs = [{"id": c["id"], "maxim": c["maxim"], "type": c["type"], "prompt": c["prompt"],
-             "check": c["check"], "condition": cond, "sample": s}
+             "check": c["check"], "persona": c.get("persona"), "condition": cond, "sample": s}
             for s in range(args.samples) for c in cases for cond in args.conditions]
 
     def work(job):
@@ -451,6 +453,8 @@ def report(args, run_dir: Path) -> None:
     for m in maxims:
         table([r for r in rubric if r["maxim"] == m], f"Bait cases targeting {m.capitalize()}")
     table([r for r in rubric if r["type"] == "control"], "Control cases (detail, warmth, creativity, ambiguity)")
+    for persona in sorted({r.get("persona") for r in rubric if r.get("persona")}):
+        table([r for r in rubric if r.get("persona") == persona], f"Persona: {persona}")
 
     # Combine the two orders of each pair: agreement counts, disagreement is a tie.
     raw = [p for p in read_jsonl(run_dir / "pairwise.jsonl") if p.get("verdict")]
@@ -502,13 +506,14 @@ def report(args, run_dir: Path) -> None:
     by_key = {(r["id"], r["condition"], r["sample"]): r for r in rubric}
     ex = [f"# All sample-0 replies: {run_dir.name}", "",
           "Every case and condition, first sample. Quote from here by a stated rule.", ""]
-    for case in load_cases():
+    for case in load_cases(config.get("cases_file")):
         rows = [(c, by_key.get((case["id"], c, 0))) for c in conds]
         rows = [(c, r) for c, r in rows if r]
         if not rows:
             continue
         ex.extend([f"## `{case['id']}` ({case['maxim']}, {case['type']})", "",
-                   f"**User:** {case['prompt']}", "", f"**Case check:** {case['check']}", ""])
+                   f"**User:** {case['prompt']}", "", f"**Case check:** {case['check']}", ""]
+                  + ([f"**Source:** {case['source']}", ""] if case.get("source") else []))
         for cond, r in rows:
             sc = r["scores"]
             meta = (f"Quantity {sc['quantity']} · Quality {sc['quality']} · Relation {sc['relation']} · "
@@ -536,6 +541,7 @@ def main() -> None:
     p.add_argument("--conditions", default=None,
                    help="comma-separated: baseline,concise,skill,plugin,pointer "
                         "(default: baseline,concise,skill; plugin and pointer need claude-code)")
+    p.add_argument("--cases-file", default=None, help="JSONL test cases (default: evals/cases.jsonl)")
     p.add_argument("--cases", help="comma-separated case ids or maxims to run (default: all)")
     p.add_argument("--workers", type=int, default=None,
                    help="parallel calls (default: 4 for api, 2 for claude-code)")
@@ -550,12 +556,12 @@ def main() -> None:
     config_path = run_dir / "config.json"
     if config_path.exists():  # resuming: keep the run's original settings
         saved = json.loads(config_path.read_text())
-        for k in ("backend", "model", "judge_model", "effort", "samples", "conditions", "cases"):
+        for k in ("backend", "model", "judge_model", "effort", "samples", "conditions", "cases", "cases_file"):
             setattr(args, k, saved.get(k))
     else:
         args.conditions = (args.conditions or "baseline,concise,skill").split(",")
         config_path.write_text(json.dumps(
-            {k: getattr(args, k) for k in ("backend", "model", "judge_model", "effort", "samples", "conditions", "cases")},
+            {k: getattr(args, k) for k in ("backend", "model", "judge_model", "effort", "samples", "conditions", "cases", "cases_file")},
             indent=2))
     args.workers = args.workers or (4 if args.backend == "api" else 2)
     log(f"run: {run_dir} · backend {args.backend} · conditions {','.join(args.conditions)}")
