@@ -51,14 +51,22 @@ def skill_body() -> str:
     return text.strip()
 
 
-# Text appended to the backend's base system prompt. "plugin" appends nothing and
-# instead installs this repo as a plugin, so the agent must decide to load the skill.
-def condition_appends() -> dict:
-    return {"baseline": "", "concise": "Be concise.", "skill": skill_body(), "plugin": ""}
+# How each condition is set up. "append" is added to the backend's base system
+# prompt. "plugin" installs this repo as a plugin, so the agent must decide to load
+# the skill. "pointer" also puts this repo's one-line CLAUDE.md in the working
+# directory, the recommended install (claude-code backend only).
+def condition_setups() -> dict:
+    return {
+        "baseline": {"append": ""},
+        "concise": {"append": "Be concise."},
+        "skill": {"append": skill_body()},
+        "plugin": {"append": "", "plugin": True},
+        "pointer": {"append": "", "plugin": True, "claude_md": (REPO / "CLAUDE.md").read_text()},
+    }
 
 
 # (challenger, opponent) pairs for pairwise judging, when both conditions ran.
-PAIRS = [("skill", "baseline"), ("skill", "concise"), ("plugin", "baseline")]
+PAIRS = [("skill", "baseline"), ("skill", "concise"), ("plugin", "baseline"), ("pointer", "baseline")]
 
 FILLER = re.compile(
     r"\b(great question|good question|certainly!|of course!|i hope this helps|"
@@ -122,9 +130,9 @@ class ApiBackend:
 
     # No server-side refusal fallback on purpose: a fallback would answer with a
     # different model and contaminate the comparison.
-    def ask(self, model, prompt, append="", schema=None, plugin=False) -> dict:
-        if plugin:
-            raise SystemExit("the 'plugin' condition needs --backend claude-code")
+    def ask(self, model, prompt, append="", schema=None, plugin=False, claude_md=None) -> dict:
+        if plugin or claude_md:
+            raise SystemExit("the 'plugin' and 'pointer' conditions need --backend claude-code")
         output_config = {"effort": self.effort}
         if schema is not None:
             output_config["format"] = {"type": "json_schema", "schema": schema}
@@ -151,10 +159,24 @@ class ClaudeCodeBackend:
     def __init__(self, effort: str, gate: UsageGate, timeout: int = 600):
         self.effort, self.gate, self.timeout = effort, gate, timeout
         self.workdir = tempfile.mkdtemp(prefix="grice-eval-")  # empty: no CLAUDE.md
+        self.md_workdirs = {}
 
-    def ask(self, model, prompt, append="", schema=None, plugin=False) -> dict:
+    def _workdir_with(self, claude_md: str) -> str:
+        # A separate directory whose only file is the given CLAUDE.md.
+        if claude_md not in self.md_workdirs:
+            d = tempfile.mkdtemp(prefix="grice-eval-md-")
+            Path(d, "CLAUDE.md").write_text(claude_md)
+            self.md_workdirs[claude_md] = d
+        return self.md_workdirs[claude_md]
+
+    def ask(self, model, prompt, append="", schema=None, plugin=False, claude_md=None) -> dict:
+        # User settings (hooks, plugins, ~/.claude/CLAUDE.md) are always off. Project
+        # settings are on only when a CLAUDE.md is under test; its directory holds
+        # nothing else.
+        workdir = self._workdir_with(claude_md) if claude_md else self.workdir
         cmd = ["claude", "-p", prompt, "--model", model, "--effort", self.effort,
-               "--setting-sources", "", "--strict-mcp-config", "--no-session-persistence",
+               "--setting-sources", "project" if claude_md else "",
+               "--strict-mcp-config", "--no-session-persistence",
                "--output-format", "stream-json", "--verbose"]
         if plugin:
             cmd += ["--plugin-dir", str(REPO), "--tools", "Skill"]
@@ -165,7 +187,7 @@ class ClaudeCodeBackend:
         if schema is not None:
             cmd += ["--json-schema", json.dumps(schema)]
         try:
-            proc = subprocess.run(cmd, cwd=self.workdir, stdin=subprocess.DEVNULL,
+            proc = subprocess.run(cmd, cwd=workdir, stdin=subprocess.DEVNULL,
                                   capture_output=True, text=True, timeout=self.timeout)
         except subprocess.TimeoutExpired:
             return {"text": "", "stop_reason": "error: timeout"}
@@ -260,7 +282,7 @@ def stop_at_gate(run_dir: Path, stage: str, gate: UsageGate) -> None:
 # --------------------------------------------------------------------- generate
 
 def generate(args, backend, gate, run_dir: Path) -> None:
-    appends = condition_appends()
+    setups = condition_setups()
     cases = load_cases()
     if args.cases:
         wanted = set(args.cases.split(","))
@@ -270,8 +292,9 @@ def generate(args, backend, gate, run_dir: Path) -> None:
             for s in range(args.samples) for c in cases for cond in args.conditions]
 
     def work(job):
-        r = backend.ask(args.model, job["prompt"], append=appends[job["condition"]],
-                        plugin=job["condition"] == "plugin")
+        setup = setups[job["condition"]]
+        r = backend.ask(args.model, job["prompt"], append=setup["append"],
+                        plugin=setup.get("plugin", False), claude_md=setup.get("claude_md"))
         return {**job, "reply": r["text"], "stop_reason": r["stop_reason"],
                 "skill_invoked": r.get("skill_invoked"), "cost_usd": r.get("cost_usd")}
 
@@ -460,11 +483,13 @@ def report(args, run_dir: Path) -> None:
             out.append(f"| {ch} | {op} | {subset} | {w} | {t} | {l} | {rate} | {ci} |")
     out.append("")
 
-    plugin_rows = [r for r in read_jsonl(run_dir / "responses.jsonl") if r["condition"] == "plugin"]
-    if plugin_rows:
-        n = sum(bool(r.get("skill_invoked")) for r in plugin_rows)
-        out.extend(["## Skill triggering (plugin condition)", "",
-                    f"The agent loaded the skill in {n} of {len(plugin_rows)} replies ({n / len(plugin_rows):.0%}).", ""])
+    responses = read_jsonl(run_dir / "responses.jsonl")
+    for cond in ("plugin", "pointer"):
+        rows = [r for r in responses if r["condition"] == cond and not r["stop_reason"].startswith("error")]
+        if rows:
+            n = sum(bool(r.get("skill_invoked")) for r in rows)
+            out.extend([f"## Skill triggering ({cond} condition)", "",
+                        f"The agent loaded the skill in {n} of {len(rows)} replies ({n / len(rows):.0%}).", ""])
 
     costs = [r.get("cost_usd") for r in read_jsonl(run_dir / "responses.jsonl") if r.get("cost_usd")]
     if costs:
@@ -489,7 +514,7 @@ def report(args, run_dir: Path) -> None:
             meta = (f"Quantity {sc['quantity']} · Quality {sc['quality']} · Relation {sc['relation']} · "
                     f"Manner {sc['manner']} · check {'pass' if sc['case_check'] else 'fail'} · "
                     f"{len(r['reply'].split())} words")
-            if cond == "plugin":
+            if cond in ("plugin", "pointer"):
                 meta += f" · skill {'loaded' if r.get('skill_invoked') else 'not loaded'}"
             ex.extend([f"**{cond}** ({meta})", "", "````markdown", r["reply"].strip(), "````", ""])
     (run_dir / "examples.md").write_text("\n".join(ex))
@@ -509,8 +534,8 @@ def main() -> None:
     p.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
     p.add_argument("--samples", type=int, default=3, help="replies per case and condition")
     p.add_argument("--conditions", default=None,
-                   help="comma-separated: baseline,concise,skill,plugin "
-                        "(default: baseline,concise,skill; plugin needs claude-code)")
+                   help="comma-separated: baseline,concise,skill,plugin,pointer "
+                        "(default: baseline,concise,skill; plugin and pointer need claude-code)")
     p.add_argument("--cases", help="comma-separated case ids or maxims to run (default: all)")
     p.add_argument("--workers", type=int, default=None,
                    help="parallel calls (default: 4 for api, 2 for claude-code)")

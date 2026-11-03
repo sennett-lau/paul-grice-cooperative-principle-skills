@@ -119,7 +119,12 @@ The harness has two backends.
 
 **Claude API** (`--backend api`, the default) needs `ANTHROPIC_API_KEY`. The baseline system prompt is `You are a helpful assistant.`, so this isolates the effect of the skill text.
 
-**Claude Code** (`--backend claude-code`) runs each prompt through headless `claude -p` with your Claude login, in an empty temporary directory. User and project settings, hooks, `CLAUDE.md` and MCP servers are switched off (`--setting-sources "" --strict-mcp-config --tools ""`). The baseline is Claude Code's own system prompt, so this measures what the skill adds where people actually use it. This backend also supports a fourth condition, `plugin`, which installs this repo with `--plugin-dir` and lets the agent decide whether to load the skill. The report shows how often it did.
+**Claude Code** (`--backend claude-code`) runs each prompt through headless `claude -p` with your Claude login, in an empty temporary directory. User and project settings, hooks, `CLAUDE.md` and MCP servers are switched off (`--setting-sources "" --strict-mcp-config --tools ""`). The baseline is Claude Code's own system prompt, so this measures what the skill adds where people actually use it. This backend supports two more conditions:
+
+- `plugin` installs this repo with `--plugin-dir` and lets the agent decide on its own whether to load the skill.
+- `pointer` does the same, and also places this repo's one-line [`CLAUDE.md`](CLAUDE.md) in the working directory. This is the recommended install. Project settings are switched on for this condition so that the `CLAUDE.md` is read; the directory contains nothing else.
+
+For both, the report shows how often the agent loaded the skill.
 
 ```bash
 pip install -r evals/requirements.txt   # only needed for the api backend
@@ -129,7 +134,7 @@ python evals/run_eval.py all --samples 1
 
 # Inside Claude Code, with the plugin condition
 python evals/run_eval.py all --backend claude-code --samples 1 \
-  --conditions baseline,concise,skill,plugin
+  --conditions baseline,concise,skill,plugin,pointer
 ```
 
 **Cost (api backend):** 26 cases × 3 conditions × 3 samples = 234 replies, plus 234 rubric calls and 312 pairwise calls (26 cases × 3 samples × 2 comparisons × 2 orders). Start with `--samples 1`.

@@ -20,7 +20,7 @@ python evals/run_eval.py all --cases quality,control                    # a subs
 
 # Through headless Claude Code with your Claude login, stopping at 20% of the 5-hour usage window
 python evals/run_eval.py all --backend claude-code --samples 1 \
-  --conditions baseline,concise,skill,plugin --usage-gate 0.20
+  --conditions baseline,concise,skill,plugin,pointer --usage-gate 0.20
 
 # Resume a stopped run (keeps its settings; raise the gate to approve more usage)
 python evals/run_eval.py all --run evals/results/<run-id> --usage-gate 0.40
