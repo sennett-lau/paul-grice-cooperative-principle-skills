@@ -1,0 +1,11 @@
+{
+  "name": "paul-grice-cooperative-principle-skills",
+  "description": "Conversational guidelines for agents, derived from Paul Grice's Cooperative Principle and its four maxims: Quantity, Quality, Relation, Manner",
+  "version": "1.0.0",
+  "author": {
+    "name": "sennett-lau"
+  },
+  "license": "MIT",
+  "keywords": ["communication", "grice", "cooperative-principle", "maxims", "pragmatics"],
+  "skills": ["./skills/cooperative-principle"]
+}

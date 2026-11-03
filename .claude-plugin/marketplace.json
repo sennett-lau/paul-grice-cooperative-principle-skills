@@ -1,0 +1,24 @@
+{
+  "name": "grice-skills",
+  "id": "grice-skills",
+  "owner": {
+    "name": "sennett-lau"
+  },
+  "metadata": {
+    "description": "Conversational guidelines for agents, derived from Paul Grice's Cooperative Principle",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "paul-grice-cooperative-principle-skills",
+      "source": "./",
+      "description": "Grice's four conversational maxims as agent guidelines: Quantity, Quality, Relation, Manner",
+      "version": "1.0.0",
+      "author": {
+        "name": "sennett-lau"
+      },
+      "keywords": ["communication", "grice", "cooperative-principle", "maxims", "pragmatics"],
+      "category": "workflow"
+    }
+  ]
+}
