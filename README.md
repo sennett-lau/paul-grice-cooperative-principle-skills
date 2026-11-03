@@ -2,7 +2,24 @@
 
 # Paul Grice Cooperative Principle Skills
 
-An agent skill (plus a drop-in `CLAUDE.md`) that makes an agent talk the way Paul Grice described cooperative conversation: say what is needed, say only what is true, stay relevant, and be clear.
+An agent skill that makes an agent talk the way Paul Grice described cooperative conversation: say what is needed, say only what is true, stay relevant, and be clear.
+
+## Quick Install
+
+Paste this into your coding agent (Claude Code, Codex, or another agent that supports Agent Skills):
+
+```
+Install the cooperative-principle skill from
+https://github.com/sennett-lau/paul-grice-cooperative-principle-skills
+1. Copy the folder skills/cooperative-principle/ from that repository into your personal skills folder
+   (Claude Code: ~/.claude/skills/, Codex: ~/.agents/skills/).
+2. In this project's agent instruction file (CLAUDE.md for Claude Code, AGENTS.md for Codex),
+   append the contents of https://raw.githubusercontent.com/sennett-lau/paul-grice-cooperative-principle-skills/main/CLAUDE.md
+   without changing anything else. Create the file if it does not exist.
+3. Show me what you changed.
+```
+
+Step 2 adds one short instruction that tells the agent to load the skill. Without it, the agent decides on its own whether the skill is relevant, and it often decides not to (see [Install](#install)).
 
 ## The Problem
 
@@ -91,7 +108,21 @@ Grice lists ways a speaker can fail to fulfil a maxim: quietly violate it, openl
 
 ## Install
 
-**Option A: Claude Code plugin (recommended)**
+Installation has two parts: the skill itself, and one line in your instruction file that tells the agent to load it.
+
+The full guidelines live only in the skill. Your `CLAUDE.md` or `AGENTS.md` gets just this:
+
+```markdown
+## Communication
+
+At the start of each conversation, load the `cooperative-principle` skill (if it is not already loaded) and follow it in every reply to the user.
+```
+
+The line matters. An agent loads a skill when it judges the skill relevant to the task, and a question like "What's the default port for PostgreSQL?" doesn't look like a communication task. In our first trial, Claude Code with the skill installed but no pointer line loaded it in only 5 of 26 replies (see [EVALUATION.md](EVALUATION.md)).
+
+### 1. Install the skill
+
+**Claude Code: plugin (recommended)**
 
 From within Claude Code, add the marketplace:
 ```
@@ -103,26 +134,31 @@ Then install the plugin:
 /plugin install paul-grice-cooperative-principle-skills@grice-skills
 ```
 
-This installs the `cooperative-principle` skill for all your projects.
+**Claude Code: copy the folder**
 
-**Option B: CLAUDE.md (per project, always on)**
+Copy [`skills/cooperative-principle/`](skills/cooperative-principle/) into `~/.claude/skills/` (all projects) or `.claude/skills/` (one project).
 
-A skill loads when the agent decides it is relevant. Communication style applies to every reply, so if you want the rules on all the time, put them in `CLAUDE.md` instead.
+**Codex**
 
-New project:
+Copy [`skills/cooperative-principle/`](skills/cooperative-principle/) into `~/.agents/skills/` (all repositories) or `.agents/skills/` (one repository).
+
+**Other agents**
+
+Any agent that supports the Agent Skills format can use [`skills/cooperative-principle/`](skills/cooperative-principle/). Put it wherever that agent looks for skills.
+
+### 2. Add the pointer line
+
+Claude Code (`CLAUDE.md`):
 ```bash
-curl -o CLAUDE.md https://raw.githubusercontent.com/sennett-lau/paul-grice-cooperative-principle-skills/main/CLAUDE.md
-```
-
-Existing project (append):
-```bash
-echo "" >> CLAUDE.md
 curl https://raw.githubusercontent.com/sennett-lau/paul-grice-cooperative-principle-skills/main/CLAUDE.md >> CLAUDE.md
 ```
 
-**Option C: Other agents**
+Codex and other agents that read `AGENTS.md`:
+```bash
+curl https://raw.githubusercontent.com/sennett-lau/paul-grice-cooperative-principle-skills/main/CLAUDE.md >> AGENTS.md
+```
 
-Copy the body of [`CLAUDE.md`](CLAUDE.md) into the instruction file your agent reads (for example `AGENTS.md`), or copy [`skills/cooperative-principle/`](skills/cooperative-principle/) into any agent that supports the Agent Skills format.
+For a personal setup across all projects, add the line to `~/.claude/CLAUDE.md` (Claude Code) or `~/.codex/AGENTS.md` (Codex) instead.
 
 ## Using with Cursor
 
@@ -159,7 +195,7 @@ You should see:
 
 ## Customization
 
-These guidelines are meant to be merged with your own instructions. For project-specific rules, add a section such as:
+The skill holds the general rules. Put project-specific rules in your own instruction file, next to the pointer line, for example:
 
 ```markdown
 ## Project-Specific Guidelines
