@@ -189,10 +189,6 @@ Further reading:
 
 Page numbers for the 1975 chapter refer to the Cole & Morgan edition.
 
-## Acknowledgements
-
-The repository layout follows [multica-ai/andrej-karpathy-skills](https://github.com/multica-ai/andrej-karpathy-skills).
-
 ## License
 
 [MIT](LICENSE)
