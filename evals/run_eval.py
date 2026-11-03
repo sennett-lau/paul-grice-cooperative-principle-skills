@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+"""A/B evaluation of the cooperative-principle skill. See ../EVALUATION.md.
+
+Stages:
+  generate  Ask every case under each condition.
+  judge     Blind rubric scores per reply, plus pairwise preference (order swapped).
+  report    Aggregate into report.md, and write every sample-0 pair to examples.md.
+  all       generate + judge + report.
+
+Backends:
+  api          Anthropic API (needs ANTHROPIC_API_KEY). Baseline system prompt:
+               "You are a helpful assistant."
+  claude-code  Headless `claude -p`, using your Claude login. Baseline is Claude
+               Code's own system prompt; user/project settings, hooks, CLAUDE.md
+               and MCP servers are switched off.
+
+Every result is appended to disk as soon as it arrives, so a stopped run can be
+resumed with `--run <dir>`. With the claude-code backend, a usage gate stops
+launching new calls once the plan's usage window reaches --usage-gate, writes
+progress.json and exits with code 3.
+"""
+
+import argparse
+import json
+import math
+import random
+import re
+import statistics
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+SKILL_FILE = REPO / "skills" / "cooperative-principle" / "SKILL.md"
+CASES_FILE = HERE / "cases.jsonl"
+RESULTS_DIR = HERE / "results"
+
+API_BASE_SYSTEM = "You are a helpful assistant."
+GATED_EXIT = 3
+
+
+def skill_body() -> str:
+    text = SKILL_FILE.read_text()
+    if text.startswith("---"):
+        text = text.split("---", 2)[2]  # drop YAML frontmatter
+    return text.strip()
+
+
+# Text appended to the backend's base system prompt. "plugin" appends nothing and
+# instead installs this repo as a plugin, so the agent must decide to load the skill.
+def condition_appends() -> dict:
+    return {"baseline": "", "concise": "Be concise.", "skill": skill_body(), "plugin": ""}
+
+
+# (challenger, opponent) pairs for pairwise judging, when both conditions ran.
+PAIRS = [("skill", "baseline"), ("skill", "concise"), ("plugin", "baseline")]
+
+FILLER = re.compile(
+    r"\b(great question|good question|certainly!|of course!|i hope this helps|"
+    r"let me know if|happy to help|feel free to|hope that helps)",
+    re.IGNORECASE,
+)
+
+
+def load_cases() -> list:
+    return [json.loads(line) for line in CASES_FILE.read_text().splitlines() if line.strip()]
+
+
+def read_jsonl(path: Path) -> list:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------- backends
+
+class UsageGate:
+    """Tracks plan usage reported by `claude -p` and blocks new calls at a threshold."""
+
+    def __init__(self, threshold: float, window: str):
+        self.threshold, self.window = threshold, window
+        self.latest = None   # {"five_hour": 0.04, "seven_day": 0.46, ...}
+        self.lock = threading.Lock()
+
+    def update(self, windows: dict) -> None:
+        if windows:
+            with self.lock:
+                self.latest = {k: v.get("utilization") for k, v in windows.items()}
+
+    def value(self):
+        with self.lock:
+            return None if self.latest is None else self.latest.get(self.window)
+
+    def blocked(self) -> bool:
+        v = self.value()
+        return v is not None and v >= self.threshold
+
+    def describe(self) -> str:
+        with self.lock:
+            if not self.latest:
+                return "usage: not reported yet"
+            return "usage: " + ", ".join(f"{k} {v:.0%}" for k, v in self.latest.items() if v is not None)
+
+
+class ApiBackend:
+    name = "api"
+
+    def __init__(self, effort: str):
+        import anthropic
+        self.anthropic = anthropic
+        self.client = anthropic.Anthropic(max_retries=6)
+        self.effort = effort
+
+    # No server-side refusal fallback on purpose: a fallback would answer with a
+    # different model and contaminate the comparison.
+    def ask(self, model, prompt, append="", schema=None, plugin=False) -> dict:
+        if plugin:
+            raise SystemExit("the 'plugin' condition needs --backend claude-code")
+        output_config = {"effort": self.effort}
+        if schema is not None:
+            output_config["format"] = {"type": "json_schema", "schema": schema}
+        system = API_BASE_SYSTEM + ("\n\n" + append if append else "")
+        try:
+            resp = self.client.messages.create(
+                model=model, max_tokens=16000, system=system, output_config=output_config,
+                messages=[{"role": "user", "content": prompt}])
+        except self.anthropic.APIError as e:
+            return {"text": "", "stop_reason": f"error: {e}"}
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        out = {"text": text, "stop_reason": resp.stop_reason}
+        if schema is not None:
+            try:
+                out["structured"] = json.loads(text)
+            except json.JSONDecodeError:
+                out["stop_reason"] = "error: invalid JSON"
+        return out
+
+
+class ClaudeCodeBackend:
+    name = "claude-code"
+
+    def __init__(self, effort: str, gate: UsageGate, timeout: int = 600):
+        self.effort, self.gate, self.timeout = effort, gate, timeout
+        self.workdir = tempfile.mkdtemp(prefix="grice-eval-")  # empty: no CLAUDE.md
+
+    def ask(self, model, prompt, append="", schema=None, plugin=False) -> dict:
+        cmd = ["claude", "-p", prompt, "--model", model, "--effort", self.effort,
+               "--setting-sources", "", "--strict-mcp-config", "--no-session-persistence",
+               "--output-format", "stream-json", "--verbose"]
+        if plugin:
+            cmd += ["--plugin-dir", str(REPO), "--tools", "Skill"]
+        else:
+            cmd += ["--tools", ""]
+        if append:
+            cmd += ["--append-system-prompt", append]
+        if schema is not None:
+            cmd += ["--json-schema", json.dumps(schema)]
+        try:
+            proc = subprocess.run(cmd, cwd=self.workdir, stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            return {"text": "", "stop_reason": "error: timeout"}
+
+        out = {"text": "", "stop_reason": "error: no result", "skill_invoked": False}
+        for line in proc.stdout.splitlines():
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = o.get("type")
+            if t == "rate_limit_event":
+                self.gate.update(o.get("rate_limit_info", {}).get("unifiedWindows", {}))
+            elif t == "assistant":
+                for b in o.get("message", {}).get("content", []):
+                    if b.get("type") == "tool_use" and b.get("name") == "Skill":
+                        out["skill_invoked"] = True
+            elif t == "result":
+                out["text"] = o.get("result") or ""
+                out["stop_reason"] = (f"error: {o.get('subtype')}" if o.get("is_error")
+                                      else o.get("stop_reason") or "end_turn")
+                out["cost_usd"] = o.get("total_cost_usd")
+                if schema is not None:
+                    out["structured"] = o.get("structured_output")
+                    if out["structured"] is None:
+                        out["stop_reason"] = "error: no structured output"
+        if proc.returncode != 0 and not out["text"]:
+            out["stop_reason"] = f"error: exit {proc.returncode}: {proc.stderr.strip()[:300]}"
+        return out
+
+
+# ------------------------------------------------------------ gated job runner
+
+def run_jobs(label, jobs, key, work, out_path: Path, workers: int, gate: UsageGate):
+    """Run jobs with bounded concurrency, append each result to out_path, skip
+    jobs already on disk, and stop launching new ones once the gate is reached.
+    Returns True if all jobs are done, False if the gate stopped the stage."""
+    ok = lambda r: not str(r.get("stop_reason", "")).startswith("error")
+    kept = [r for r in read_jsonl(out_path) if ok(r)]  # errored rows are dropped and retried
+    done = {key(r) for r in kept}
+    out_path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept))
+    pending = [j for j in jobs if key(j) not in done]
+    total = len(jobs)
+    log(f"{label}: {total - len(pending)}/{total} already done, {len(pending)} to run "
+        f"({workers} at a time; {gate.describe()})")
+
+    lock = threading.Lock()
+    finished = total - len(pending)
+    gated = False
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        running = set()
+        queue = list(pending)
+        while queue or running:
+            while queue and len(running) < workers:
+                if gate.blocked():
+                    gated = True
+                    break
+                running.add(pool.submit(work, queue.pop(0)))
+            if gated and not running:
+                break
+            if not running:
+                break
+            completed, running = wait(running, return_when=FIRST_COMPLETED)
+            running = set(running)
+            for fut in completed:
+                row = fut.result()
+                with lock:
+                    with out_path.open("a") as f:
+                        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    finished += 1
+                err = " (error)" if str(row.get("stop_reason", "")).startswith("error") else ""
+                log(f"{label}: {finished}/{total}{err} · {gate.describe()}")
+            if gated:
+                queue = []  # stop launching; let running calls finish
+    return not gated and finished == total
+
+
+def stop_at_gate(run_dir: Path, stage: str, gate: UsageGate) -> None:
+    progress = {"stopped_at": time.strftime("%Y-%m-%d %H:%M:%S"), "stage": stage,
+                "gate": {"window": gate.window, "threshold": gate.threshold},
+                "usage": gate.latest}
+    for name in ("responses", "rubric", "pairwise"):
+        progress[f"{name}_done"] = len(read_jsonl(run_dir / f"{name}.jsonl"))
+    (run_dir / "progress.json").write_text(json.dumps(progress, indent=2))
+    log(f"\nUSAGE GATE: {gate.window} usage reached {gate.value():.0%} "
+        f"(gate {gate.threshold:.0%}) during '{stage}'. No new calls were started.")
+    log(f"Progress saved to {run_dir / 'progress.json'}.")
+    log(f"To continue, re-run with --run {run_dir} (and a higher --usage-gate if needed).")
+    sys.exit(GATED_EXIT)
+
+
+# --------------------------------------------------------------------- generate
+
+def generate(args, backend, gate, run_dir: Path) -> None:
+    appends = condition_appends()
+    cases = load_cases()
+    if args.cases:
+        wanted = set(args.cases.split(","))
+        cases = [c for c in cases if c["id"] in wanted or c["maxim"] in wanted]
+    jobs = [{"id": c["id"], "maxim": c["maxim"], "type": c["type"], "prompt": c["prompt"],
+             "check": c["check"], "condition": cond, "sample": s}
+            for s in range(args.samples) for c in cases for cond in args.conditions]
+
+    def work(job):
+        r = backend.ask(args.model, job["prompt"], append=appends[job["condition"]],
+                        plugin=job["condition"] == "plugin")
+        return {**job, "reply": r["text"], "stop_reason": r["stop_reason"],
+                "skill_invoked": r.get("skill_invoked"), "cost_usd": r.get("cost_usd")}
+
+    key = lambda r: (r["id"], r["condition"], r["sample"])
+    if not run_jobs("generate", jobs, key, work, run_dir / "responses.jsonl", args.workers, gate):
+        stop_at_gate(run_dir, "generate", gate)
+
+
+# ------------------------------------------------------------------------ judge
+
+RUBRIC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "quantity": {"type": "integer"},
+        "quality": {"type": "integer"},
+        "relation": {"type": "integer"},
+        "manner": {"type": "integer"},
+        "case_check": {"type": "boolean"},
+        "notes": {"type": "string"},
+    },
+    "required": ["quantity", "quality", "relation", "manner", "case_check", "notes"],
+    "additionalProperties": False,
+}
+
+RUBRIC_PROMPT = """You are grading one assistant reply. You do not know how it was produced.
+
+<user_message>
+{prompt}
+</user_message>
+
+<reply>
+{reply}
+</reply>
+
+<case_requirement>
+{check}
+</case_requirement>
+
+Score the reply from 1 to 5 on each of Grice's conversational maxims, judged against what THIS user needs for THIS purpose:
+
+- quantity: 5 = gives what the user needs and nothing more; the answer comes first; essentials present. 1 = the answer is buried or missing, or the reply is heavily padded. Length is not a virtue or a fault in itself: a thorough reply to a request for detail can score 5.
+- quality: 5 = every claim is accurate or clearly marked as uncertain; nothing is invented; false premises are corrected. 1 = states false or unsupported things as fact.
+- relation: 5 = everything serves the question and the goal behind it. 1 = mostly tangents.
+- manner: 5 = clear, unambiguous, well ordered, easy to follow in one pass, suited to the audience. 1 = obscure, ambiguous, or disordered.
+- case_check: true if the reply meets the case requirement, else false.
+- notes: one short sentence explaining the lowest score."""
+
+PAIR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "winner": {"type": "string", "enum": ["A", "B", "tie"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["winner", "reason"],
+    "additionalProperties": False,
+}
+
+PAIR_PROMPT = """Two assistant replies to the same user message. You do not know how they were produced.
+
+<user_message>
+{prompt}
+</user_message>
+
+<reply_A>
+{a}
+</reply_A>
+
+<reply_B>
+{b}
+</reply_B>
+
+Which reply is more cooperative? That is: which one would this user find easier to follow and act on, while it stays accurate and complete enough for their purpose? Do not prefer a reply for being shorter or longer as such. Answer "tie" only if neither is better.
+
+Return the winner ("A", "B", or "tie") and a one-sentence reason."""
+
+
+def judge(args, backend, gate, run_dir: Path) -> None:
+    rows = [r for r in read_jsonl(run_dir / "responses.jsonl") if r["reply"]]
+
+    def rubric(row):
+        prompt = RUBRIC_PROMPT.format(prompt=row["prompt"], reply=row["reply"], check=row["check"])
+        r = backend.ask(args.judge_model, prompt, schema=RUBRIC_SCHEMA)
+        return {**row, "scores": r.get("structured"), "stop_reason": r["stop_reason"]}
+
+    key = lambda r: (r["id"], r["condition"], r["sample"])
+    if not run_jobs("judge/rubric", rows, key, rubric, run_dir / "rubric.jsonl", args.workers, gate):
+        stop_at_gate(run_dir, "judge/rubric", gate)
+
+    # Pairwise: challenger vs opponent, same case and sample, judged in both orders.
+    by_key = {key(r): r for r in rows}
+    jobs = []
+    for (cid, cond, sample), r in sorted(by_key.items()):
+        for challenger, opponent in PAIRS:
+            o = by_key.get((cid, opponent, sample))
+            if cond == challenger and o:
+                for challenger_first in (True, False):
+                    jobs.append({"id": cid, "maxim": r["maxim"], "type": r["type"], "sample": sample,
+                                 "challenger": challenger, "opponent": opponent,
+                                 "challenger_first": challenger_first})
+    random.Random(0).shuffle(jobs)
+
+    def pairwise(job):
+        c = by_key[(job["id"], job["challenger"], job["sample"])]
+        o = by_key[(job["id"], job["opponent"], job["sample"])]
+        a, b = (c, o) if job["challenger_first"] else (o, c)
+        r = backend.ask(args.judge_model, PAIR_PROMPT.format(prompt=c["prompt"], a=a["reply"], b=b["reply"]),
+                        schema=PAIR_SCHEMA)
+        w = (r.get("structured") or {}).get("winner")
+        verdict = ("tie" if w == "tie" else
+                   "challenger" if (w == "A") == job["challenger_first"] else "opponent") if w else None
+        return {**job, "verdict": verdict, "stop_reason": r["stop_reason"] if w else "error: no verdict"}
+
+    pkey = lambda r: (r["id"], r["sample"], r["challenger"], r["opponent"], r["challenger_first"])
+    if not run_jobs("judge/pairwise", jobs, pkey, pairwise, run_dir / "pairwise.jsonl", args.workers, gate):
+        stop_at_gate(run_dir, "judge/pairwise", gate)
+
+
+# ----------------------------------------------------------------------- report
+
+def wilson(wins: int, n: int, z: float = 1.96) -> tuple:
+    p = wins / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return (centre - half, centre + half)
+
+
+def report(args, run_dir: Path) -> None:
+    rubric = [r for r in read_jsonl(run_dir / "rubric.jsonl") if r.get("scores")]
+    config = json.loads((run_dir / "config.json").read_text())
+    conds = config["conditions"]
+    maxims = ["quantity", "quality", "relation", "manner"]
+    out = [f"# Evaluation report: {run_dir.name}", "",
+           f"Backend `{config['backend']}` · model `{config['model']}` · judge `{config['judge_model']}` · "
+           f"effort `{config['effort']}` · {config['samples']} sample(s) per case and condition", ""]
+
+    def table(rows, title):
+        out.extend([f"### {title}", "",
+                    "| Condition | n | Quantity | Quality | Relation | Manner | Case check | Median words | Filler phrases |",
+                    "|---|---|---|---|---|---|---|---|---|"])
+        for cond in conds:
+            rs = [r for r in rows if r["condition"] == cond]
+            if not rs:
+                continue
+            means = [statistics.mean(r["scores"][m] for r in rs) for m in maxims]
+            check = sum(bool(r["scores"]["case_check"]) for r in rs) / len(rs)
+            words = statistics.median(len(r["reply"].split()) for r in rs)
+            filler = sum(len(FILLER.findall(r["reply"])) for r in rs)
+            out.append(f"| {cond} | {len(rs)} | " + " | ".join(f"{m:.2f}" for m in means)
+                       + f" | {check:.0%} | {words:.0f} | {filler} |")
+        out.append("")
+
+    out.extend(["## Rubric scores (1–5) and metrics", ""])
+    table(rubric, "All cases")
+    for m in maxims:
+        table([r for r in rubric if r["maxim"] == m], f"Bait cases targeting {m.capitalize()}")
+    table([r for r in rubric if r["type"] == "control"], "Control cases (detail, warmth, creativity, ambiguity)")
+
+    # Combine the two orders of each pair: agreement counts, disagreement is a tie.
+    raw = [p for p in read_jsonl(run_dir / "pairwise.jsonl") if p.get("verdict")]
+    grouped = {}
+    for p in raw:
+        grouped.setdefault((p["id"], p["sample"], p["challenger"], p["opponent"]), []).append(p)
+    pairs = []
+    for (cid, sample, ch, op), ps in grouped.items():
+        if len(ps) == 2:
+            v = ps[0]["verdict"] if ps[0]["verdict"] == ps[1]["verdict"] else "tie"
+            pairs.append({"challenger": ch, "opponent": op, "type": ps[0]["type"], "winner": v})
+
+    out.extend(["## Pairwise preference (both orders; disagreement = tie)", "",
+                "| Challenger | Opponent | Subset | Challenger wins | Ties | Opponent wins | Win rate (excl. ties) | 95% CI |",
+                "|---|---|---|---|---|---|---|---|"])
+    for ch, op in PAIRS:
+        for subset in ("all", "bait", "control"):
+            ps = [p for p in pairs if p["challenger"] == ch and p["opponent"] == op
+                  and (subset == "all" or p["type"] == subset)]
+            if not ps:
+                continue
+            w = sum(p["winner"] == "challenger" for p in ps)
+            t = sum(p["winner"] == "tie" for p in ps)
+            l = len(ps) - w - t
+            if w + l:
+                lo, hi = wilson(w, w + l)
+                rate, ci = f"{w / (w + l):.0%}", f"{lo:.0%}–{hi:.0%}"
+            else:
+                rate = ci = "–"
+            out.append(f"| {ch} | {op} | {subset} | {w} | {t} | {l} | {rate} | {ci} |")
+    out.append("")
+
+    plugin_rows = [r for r in read_jsonl(run_dir / "responses.jsonl") if r["condition"] == "plugin"]
+    if plugin_rows:
+        n = sum(bool(r.get("skill_invoked")) for r in plugin_rows)
+        out.extend(["## Skill triggering (plugin condition)", "",
+                    f"The agent loaded the skill in {n} of {len(plugin_rows)} replies ({n / len(plugin_rows):.0%}).", ""])
+
+    costs = [r.get("cost_usd") for r in read_jsonl(run_dir / "responses.jsonl") if r.get("cost_usd")]
+    if costs:
+        out.extend([f"Generation cost reported by Claude Code (API-equivalent): ${sum(costs):.2f}", ""])
+
+    (run_dir / "report.md").write_text("\n".join(out))
+    print("\n".join(out))
+
+    # Every sample-0 pair, so quoted examples are not cherry-picked.
+    by_key = {(r["id"], r["condition"], r["sample"]): r for r in rubric}
+    ex = [f"# All sample-0 replies: {run_dir.name}", "",
+          "Every case and condition, first sample. Quote from here by a stated rule.", ""]
+    for case in load_cases():
+        rows = [(c, by_key.get((case["id"], c, 0))) for c in conds]
+        rows = [(c, r) for c, r in rows if r]
+        if not rows:
+            continue
+        ex.extend([f"## `{case['id']}` ({case['maxim']}, {case['type']})", "",
+                   f"**User:** {case['prompt']}", "", f"**Case check:** {case['check']}", ""])
+        for cond, r in rows:
+            sc = r["scores"]
+            meta = (f"Quantity {sc['quantity']} · Quality {sc['quality']} · Relation {sc['relation']} · "
+                    f"Manner {sc['manner']} · check {'pass' if sc['case_check'] else 'fail'} · "
+                    f"{len(r['reply'].split())} words")
+            if cond == "plugin":
+                meta += f" · skill {'loaded' if r.get('skill_invoked') else 'not loaded'}"
+            ex.extend([f"**{cond}** ({meta})", "", "````markdown", r["reply"].strip(), "````", ""])
+    (run_dir / "examples.md").write_text("\n".join(ex))
+    log(f"\nreport: wrote {run_dir / 'report.md'} and {run_dir / 'examples.md'}")
+
+
+# ------------------------------------------------------------------------- main
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("stage", choices=["generate", "judge", "report", "all"])
+    p.add_argument("--run", help="run directory; pass an existing one to resume")
+    p.add_argument("--backend", choices=["api", "claude-code"], default="api")
+    p.add_argument("--model", default="claude-opus-5-5", help="model under test")
+    p.add_argument("--judge-model", default="claude-opus-5-5",
+                   help="judge model; prefer a different model from --model to limit self-preference")
+    p.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
+    p.add_argument("--samples", type=int, default=3, help="replies per case and condition")
+    p.add_argument("--conditions", default=None,
+                   help="comma-separated: baseline,concise,skill,plugin "
+                        "(default: baseline,concise,skill; plugin needs claude-code)")
+    p.add_argument("--cases", help="comma-separated case ids or maxims to run (default: all)")
+    p.add_argument("--workers", type=int, default=None,
+                   help="parallel calls (default: 4 for api, 2 for claude-code)")
+    p.add_argument("--usage-gate", type=float, default=0.20,
+                   help="claude-code: stop starting new calls when the usage window reaches this fraction")
+    p.add_argument("--timeout", type=int, default=300, help="claude-code: seconds per call")
+    p.add_argument("--usage-window", choices=["five_hour", "seven_day"], default="five_hour")
+    args = p.parse_args()
+
+    run_dir = Path(args.run) if args.run else RESULTS_DIR / time.strftime("%Y%m%d-%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    config_path = run_dir / "config.json"
+    if config_path.exists():  # resuming: keep the run's original settings
+        saved = json.loads(config_path.read_text())
+        for k in ("backend", "model", "judge_model", "effort", "samples", "conditions", "cases"):
+            setattr(args, k, saved.get(k))
+    else:
+        args.conditions = (args.conditions or "baseline,concise,skill").split(",")
+        config_path.write_text(json.dumps(
+            {k: getattr(args, k) for k in ("backend", "model", "judge_model", "effort", "samples", "conditions", "cases")},
+            indent=2))
+    args.workers = args.workers or (4 if args.backend == "api" else 2)
+    log(f"run: {run_dir} · backend {args.backend} · conditions {','.join(args.conditions)}")
+
+    gate = UsageGate(args.usage_gate, args.usage_window)
+    if args.stage != "report":
+        backend = ApiBackend(args.effort) if args.backend == "api" else ClaudeCodeBackend(args.effort, gate, args.timeout)
+    if args.stage in ("generate", "all"):
+        generate(args, backend, gate, run_dir)
+    if args.stage in ("judge", "all"):
+        judge(args, backend, gate, run_dir)
+    if args.stage in ("report", "all"):
+        (run_dir / "progress.json").unlink(missing_ok=True)
+        report(args, run_dir)
+
+
+if __name__ == "__main__":
+    main()
