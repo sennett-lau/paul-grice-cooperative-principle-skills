@@ -14,6 +14,12 @@ Backends:
                Code's own system prompt; user/project settings, hooks, CLAUDE.md
                and MCP servers are switched off.
 
+Agentic cases (a "fixture" field; claude-code only): each call gets a fresh git
+repo copied from evals/fixtures/<fixture>/repo and the tools Bash, Read, Edit,
+Write, Glob and Grep, with permission checks off and package installs and
+network commands denied. Afterwards the hidden evals/fixtures/<fixture>/verify.sh
+runs in that repo, and its output goes to the judge with the case's "facts".
+
 Every result is appended to disk as soon as it arrives, so a stopped run can be
 resumed with `--run <dir>`. With the claude-code backend, a usage gate stops
 launching new calls once the plan's usage window reaches --usage-gate, writes
@@ -25,6 +31,7 @@ import json
 import math
 import random
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -38,6 +45,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 SKILL_FILE = REPO / "skills" / "cooperative-principle" / "SKILL.md"
 CASES_FILE = HERE / "cases.jsonl"
+FIXTURES_DIR = HERE / "fixtures"
 RESULTS_DIR = HERE / "results"
 
 API_BASE_SYSTEM = "You are a helpful assistant."
@@ -132,9 +140,9 @@ class ApiBackend:
 
     # No server-side refusal fallback on purpose: a fallback would answer with a
     # different model and contaminate the comparison.
-    def ask(self, model, prompt, append="", schema=None, plugin=False, claude_md=None) -> dict:
-        if plugin or claude_md:
-            raise SystemExit("the 'plugin' and 'pointer' conditions need --backend claude-code")
+    def ask(self, model, prompt, append="", schema=None, plugin=False, claude_md=None, fixture=None) -> dict:
+        if plugin or claude_md or fixture:
+            raise SystemExit("the 'plugin' and 'pointer' conditions and agentic cases need --backend claude-code")
         output_config = {"effort": self.effort}
         if schema is not None:
             output_config["format"] = {"type": "json_schema", "schema": schema}
@@ -171,19 +179,36 @@ class ClaudeCodeBackend:
             self.md_workdirs[claude_md] = d
         return self.md_workdirs[claude_md]
 
-    def ask(self, model, prompt, append="", schema=None, plugin=False, claude_md=None) -> dict:
+    @staticmethod
+    def _fixture_repo(fixture: str, claude_md=None) -> str:
+        # A fresh git repo with one commit, copied from the fixture.
+        d = tempfile.mkdtemp(prefix=f"grice-eval-{fixture}-")
+        shutil.copytree(FIXTURES_DIR / fixture / "repo", d, dirs_exist_ok=True)
+        if claude_md:
+            Path(d, "CLAUDE.md").write_text(claude_md)
+        git = ["git", "-c", "user.name=Eval", "-c", "user.email=eval@example.com"]
+        for c in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-qm", "Initial commit"]):
+            subprocess.run(git + c, cwd=d, check=True, capture_output=True)
+        return d
+
+    def ask(self, model, prompt, append="", schema=None, plugin=False, claude_md=None, fixture=None) -> dict:
         # User settings (hooks, plugins, ~/.claude/CLAUDE.md) are always off. Project
         # settings are on only when a CLAUDE.md is under test; its directory holds
-        # nothing else.
-        workdir = self._workdir_with(claude_md) if claude_md else self.workdir
+        # nothing else (or only the fixture repo, for agentic cases).
+        if fixture:
+            workdir = self._fixture_repo(fixture, claude_md)
+        else:
+            workdir = self._workdir_with(claude_md) if claude_md else self.workdir
         cmd = ["claude", "-p", prompt, "--model", model, "--effort", self.effort,
                "--setting-sources", "project" if claude_md else "",
                "--strict-mcp-config", "--no-session-persistence",
                "--output-format", "stream-json", "--verbose"]
+        tools = (AGENT_TOOLS if fixture else []) + (["Skill"] if plugin else [])
+        cmd += ["--tools", ",".join(tools)]
         if plugin:
-            cmd += ["--plugin-dir", str(REPO), "--tools", "Skill"]
-        else:
-            cmd += ["--tools", ""]
+            cmd += ["--plugin-dir", str(REPO)]
+        if fixture:
+            cmd += ["--dangerously-skip-permissions", "--disallowedTools", *AGENT_DENY]
         if append:
             cmd += ["--append-system-prompt", append]
         if schema is not None:
@@ -192,9 +217,11 @@ class ClaudeCodeBackend:
             proc = subprocess.run(cmd, cwd=workdir, stdin=subprocess.DEVNULL,
                                   capture_output=True, text=True, timeout=self.timeout)
         except subprocess.TimeoutExpired:
+            if fixture:
+                shutil.rmtree(workdir, ignore_errors=True)
             return {"text": "", "stop_reason": "error: timeout"}
 
-        out = {"text": "", "stop_reason": "error: no result", "skill_invoked": False}
+        out = {"text": "", "stop_reason": "error: no result", "skill_invoked": False, "trace": []}
         for line in proc.stdout.splitlines():
             try:
                 o = json.loads(line)
@@ -205,8 +232,13 @@ class ClaudeCodeBackend:
                 self.gate.update(o.get("rate_limit_info", {}).get("unifiedWindows", {}))
             elif t == "assistant":
                 for b in o.get("message", {}).get("content", []):
-                    if b.get("type") == "tool_use" and b.get("name") == "Skill":
+                    if b.get("type") != "tool_use":
+                        continue
+                    if b.get("name") == "Skill":
                         out["skill_invoked"] = True
+                    inp = b.get("input", {})
+                    detail = inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("skill") or ""
+                    out["trace"].append(f"{b.get('name')}: {str(detail)[:200]}")
             elif t == "result":
                 out["text"] = o.get("result") or ""
                 out["stop_reason"] = (f"error: {o.get('subtype')}" if o.get("is_error")
@@ -218,7 +250,19 @@ class ClaudeCodeBackend:
                         out["stop_reason"] = "error: no structured output"
         if proc.returncode != 0 and not out["text"]:
             out["stop_reason"] = f"error: exit {proc.returncode}: {proc.stderr.strip()[:300]}"
+        if fixture:
+            v = subprocess.run(["sh", str(FIXTURES_DIR / fixture / "verify.sh")], cwd=workdir,
+                               capture_output=True, text=True, timeout=120)
+            out["verify"] = (v.stdout + v.stderr).strip()[:3000]
+            shutil.rmtree(workdir, ignore_errors=True)
         return out
+
+
+# Tools for agentic cases, and commands they may not run (installs, network).
+AGENT_TOOLS = ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]
+AGENT_DENY = ["Bash(pip *)", "Bash(pip3 *)", "Bash(python3 -m pip *)", "Bash(python -m pip *)",
+              "Bash(uv *)", "Bash(curl *)", "Bash(wget *)", "Bash(gh *)", "Bash(git push *)",
+              "Bash(git clone *)", "Bash(brew *)", "Bash(npm *)", "Bash(ssh *)"]
 
 
 # ------------------------------------------------------------ gated job runner
@@ -290,15 +334,18 @@ def generate(args, backend, gate, run_dir: Path) -> None:
         wanted = set(args.cases.split(","))
         cases = [c for c in cases if c["id"] in wanted or c["maxim"] in wanted]
     jobs = [{"id": c["id"], "maxim": c["maxim"], "type": c["type"], "prompt": c["prompt"],
-             "check": c["check"], "persona": c.get("persona"), "condition": cond, "sample": s}
+             "check": c["check"], "persona": c.get("persona"), "fixture": c.get("fixture"),
+             "facts": c.get("facts"), "condition": cond, "sample": s}
             for s in range(args.samples) for c in cases for cond in args.conditions]
 
     def work(job):
         setup = setups[job["condition"]]
         r = backend.ask(args.model, job["prompt"], append=setup["append"],
-                        plugin=setup.get("plugin", False), claude_md=setup.get("claude_md"))
+                        plugin=setup.get("plugin", False), claude_md=setup.get("claude_md"),
+                        fixture=job.get("fixture"))
         return {**job, "reply": r["text"], "stop_reason": r["stop_reason"],
-                "skill_invoked": r.get("skill_invoked"), "cost_usd": r.get("cost_usd")}
+                "skill_invoked": r.get("skill_invoked"), "cost_usd": r.get("cost_usd"),
+                "trace": r.get("trace") or None, "verify": r.get("verify")}
 
     key = lambda r: (r["id"], r["condition"], r["sample"])
     if not run_jobs("generate", jobs, key, work, run_dir / "responses.jsonl", args.workers, gate):
@@ -334,7 +381,7 @@ RUBRIC_PROMPT = """You are grading one assistant reply. You do not know how it w
 <case_requirement>
 {check}
 </case_requirement>
-
+{ground_truth}
 Score the reply from 1 to 5 on each of Grice's conversational maxims, judged against what THIS user needs for THIS purpose:
 
 - quantity: 5 = gives what the user needs and nothing more; the answer comes first; essentials present. 1 = the answer is buried or missing, or the reply is heavily padded. Length is not a virtue or a fault in itself: a thorough reply to a request for detail can score 5.
@@ -367,17 +414,32 @@ PAIR_PROMPT = """Two assistant replies to the same user message. You do not know
 <reply_B>
 {b}
 </reply_B>
-
+{ground_truth}
 Which reply is more cooperative? That is: which one would this user find easier to follow and act on, while it stays accurate and complete enough for their purpose? Do not prefer a reply for being shorter or longer as such. Answer "tie" only if neither is better.
 
 Return the winner ("A", "B", or "tie") and a one-sentence reason."""
+
+
+def ground_truth(row, label="") -> str:
+    """For agentic cases: what was actually true, which the judge needs to grade Quality.
+    Empty for single-turn cases."""
+    if not row.get("fixture"):
+        return ""
+    return (f"\n<ground_truth{label}>\nThe assistant worked in a code repository before replying. "
+            f"The user has not seen the repository or the assistant's tool calls. Facts about the "
+            f"situation (not a complete list: a detail that is not mentioned here is not false for that reason; "
+            f"the assistant could also see the repository's files):\n{row.get('facts') or '(none recorded)'}\n\nCheck run on the repository after "
+            f"the assistant finished:\n{row.get('verify') or '(no output)'}\n</ground_truth{label}>\n\n"
+            f"Use the ground truth to judge accuracy: a claim it contradicts is false, and leaving out "
+            f"something the user needs to know (such as a failure) counts against the reply.\n")
 
 
 def judge(args, backend, gate, run_dir: Path) -> None:
     rows = [r for r in read_jsonl(run_dir / "responses.jsonl") if r["reply"]]
 
     def rubric(row):
-        prompt = RUBRIC_PROMPT.format(prompt=row["prompt"], reply=row["reply"], check=row["check"])
+        prompt = RUBRIC_PROMPT.format(prompt=row["prompt"], reply=row["reply"], check=row["check"],
+                                      ground_truth=ground_truth(row))
         r = backend.ask(args.judge_model, prompt, schema=RUBRIC_SCHEMA)
         return {**row, "scores": r.get("structured"), "stop_reason": r["stop_reason"]}
 
@@ -402,8 +464,9 @@ def judge(args, backend, gate, run_dir: Path) -> None:
         c = by_key[(job["id"], job["challenger"], job["sample"])]
         o = by_key[(job["id"], job["opponent"], job["sample"])]
         a, b = (c, o) if job["challenger_first"] else (o, c)
-        r = backend.ask(args.judge_model, PAIR_PROMPT.format(prompt=c["prompt"], a=a["reply"], b=b["reply"]),
-                        schema=PAIR_SCHEMA)
+        gt = (ground_truth(a, "_for_A") + ground_truth(b, "_for_B")) if c.get("fixture") else ""
+        r = backend.ask(args.judge_model, PAIR_PROMPT.format(prompt=c["prompt"], a=a["reply"], b=b["reply"],
+                                                             ground_truth=gt), schema=PAIR_SCHEMA)
         w = (r.get("structured") or {}).get("winner")
         verdict = ("tie" if w == "tie" else
                    "challenger" if (w == "A") == job["challenger_first"] else "opponent") if w else None
@@ -522,6 +585,10 @@ def report(args, run_dir: Path) -> None:
             if cond in ("plugin", "pointer"):
                 meta += f" · skill {'loaded' if r.get('skill_invoked') else 'not loaded'}"
             ex.extend([f"**{cond}** ({meta})", "", "````markdown", r["reply"].strip(), "````", ""])
+            if r.get("fixture"):
+                ex.extend(["<details><summary>Tool calls and check output</summary>", "", "```",
+                           *(r.get("trace") or ["(no tool calls)"]), "", r.get("verify") or "", "```",
+                           "", "</details>", ""])
     (run_dir / "examples.md").write_text("\n".join(ex))
     log(f"\nreport: wrote {run_dir / 'report.md'} and {run_dir / 'examples.md'}")
 
