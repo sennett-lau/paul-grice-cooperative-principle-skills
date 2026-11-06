@@ -1,0 +1,5 @@
+2026-11-06 09:05:02 LOG C-0x1a2b: payments/recon@10.0.4.12:51234 login attempt: db=payments user=recon
+2026-11-06 09:11:48 WARNING C-0x1f00: payments/api@10.0.3.7:40012 pooler error: no more connections allowed (max_client_conn)
+2026-11-06 09:11:49 WARNING C-0x1f01: payments/api@10.0.3.7:40013 pooler error: no more connections allowed (max_client_conn)
+2026-11-06 09:31:10 LOG process up: PgBouncer 1.22.1, libevent 2.1.12-stable
+2026-11-06 09:31:12 LOG C-0x0001: payments/api@10.0.3.7:40100 login attempt: db=payments user=api
