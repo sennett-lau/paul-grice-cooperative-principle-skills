@@ -172,16 +172,24 @@ This repository includes a Cursor project rule ([`.cursor/rules/cooperative-prin
 
 Hand-picked examples show what the skill is meant to do. They do not prove that it changes anything. **[EVALUATION.md](EVALUATION.md)** describes how to measure the difference, and [`evals/`](evals/) contains a runnable harness:
 
-- **Paired A/B runs:** the same model and prompts with no skill, with only "Be concise.", and with the skill
+- **Paired A/B runs:** the same model and prompts with no skill, with only "Be concise.", and with the skill (plus the skill loaded through the one-line pointer)
 - **Bait prompts per maxim:** yes/no questions that invite padding, false premises, nonexistent flags, tangent traps, jargon traps
 - **Control prompts:** cases where a long, warm, or creative reply is correct, to catch over-correction
 - **Blind LLM judging:** per-maxim rubric scores and pairwise preference with order swapping
 - **Deterministic metrics:** word count, filler phrases, case-specific pass checks
 
+The harness runs the same cases three ways:
+
+- **Claude API**: needs `ANTHROPIC_API_KEY`, billed per token.
+- **Claude Code**: headless `claude -p` with your Claude login. No API key. This is how the runs so far were done.
+- **Codex**: headless `codex exec` with your ChatGPT login. No API key. Uses the cheap `gpt-6-luna` model by default.
+
 ```bash
-pip install -r evals/requirements.txt
-python evals/run_eval.py all --samples 3
+python evals/run_eval.py all --backend claude-code --samples 1 --conditions baseline,concise,pointer
+python evals/run_eval.py all --backend codex --samples 1 --conditions baseline,concise,pointer
 ```
+
+See [`evals/README.md`](evals/README.md) for the case sets, including agentic tasks in small fixture repos, and which ones have been run.
 
 ## How to Know It's Working
 

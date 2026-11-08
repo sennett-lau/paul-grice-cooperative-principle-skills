@@ -115,7 +115,15 @@ If 1 holds and 2 does not, the honest conclusion is "this works about as well as
 
 ## Running it
 
-The harness has two backends.
+The harness can run the same cases three ways. Pick one by how you want to pay and what you want to measure.
+
+| Backend | Pays with | Default model | What the baseline is | Use it to |
+|---|---|---|---|---|
+| `api` | `ANTHROPIC_API_KEY`, billed per token | `claude-opus-5-5` | a bare system prompt: `You are a helpful assistant.` | isolate the effect of the skill text |
+| `claude-code` | your Claude login (plan usage) | `claude-opus-5-5` | Claude Code's own system prompt | measure the skill where people use it, including whether it gets loaded |
+| `codex` | your ChatGPT login (Codex usage) | `gpt-6-luna` at `--effort medium` | Codex's own system prompt | check that the result carries over to another agent and model family |
+
+The runs so far use `claude-code` with `claude-opus-5-5` (effort `medium`) as both the model under test and the judge. No API key was needed. The other two backends have only been smoke-tested.
 
 **Claude API** (`--backend api`, the default) needs `ANTHROPIC_API_KEY`. The baseline system prompt is `You are a helpful assistant.`, so this isolates the effect of the skill text.
 
@@ -126,15 +134,28 @@ The harness has two backends.
 
 For both, the report shows how often the agent loaded the skill.
 
+**Codex** (`--backend codex`) runs each prompt through headless `codex exec` with your ChatGPT login. It defaults to `gpt-6-luna`, a fast and cheap model. The cases are summaries, status reports and short answers, which don't need a frontier model or high reasoning effort; use `--effort low` to save more, or `--model` to test another model. Each run uses a temporary `CODEX_HOME` and `HOME`, so your `~/.codex/AGENTS.md`, `config.toml` and `~/.agents/skills` are not loaded; only Codex's built-in skills are. Your `auth.json` is copied into the temporary `CODEX_HOME` for the run and copied back if Codex refreshed the login. The conditions map to Codex like this:
+
+- `concise` and `skill` put their text in Codex's `developer_instructions`.
+- `plugin` installs the skill in `~/.agents/skills/` (of the temporary `HOME`).
+- `pointer` also writes the pointer line to `AGENTS.md` in the working directory.
+
+Codex does not report plan usage in its output, so the usage gate does not apply; the report shows the tokens used instead. Start with `--samples 1`.
+
 ```bash
 pip install -r evals/requirements.txt   # only needed for the api backend
 
-# Quick check
+# Claude API
+export ANTHROPIC_API_KEY=...
 python evals/run_eval.py all --samples 1
 
-# Inside Claude Code, with the plugin condition
+# Claude Code, with your Claude login
 python evals/run_eval.py all --backend claude-code --samples 1 \
   --conditions baseline,concise,skill,plugin,pointer
+
+# Codex, with your ChatGPT login and the cheap default model
+python evals/run_eval.py all --backend codex --samples 1 \
+  --conditions baseline,concise,pointer
 ```
 
 **Cost (api backend):** 26 cases × 3 conditions × 3 samples = 234 replies, plus 234 rubric calls and 312 pairwise calls (26 cases × 3 samples × 2 comparisons × 2 orders). Start with `--samples 1`.
@@ -156,13 +177,11 @@ The usage window is shared with everything else on your account, including inter
 
 ## Beyond single-turn tests
 
-The harness tests single-turn questions. Two further tests would get closer to real use:
-
-1. **Skill triggering.** The `plugin` condition measures whether the agent loads the skill on its own. A skill only helps if it is loaded.
-2. **Agentic tasks.** Give the agent small coding tasks that end in a status report, including tasks where a test fails or a tool is unavailable. Check whether the final report says what was and was not verified (Quality) and leads with the result (Quantity, Manner).
+1. **Skill triggering.** The `plugin` condition measures whether the agent loads the skill on its own. A skill only helps if it is loaded. The `pointer` condition measures the recommended install.
+2. **Agentic tasks.** `evals/cases-agentic.jsonl` and `evals/cases-agentic-hard.jsonl` give the agent small tasks in a real repo (a fixture) that end in a report, where something goes wrong that it can't fix. The judge gets the facts and the repo's state afterwards, so it can check whether the report says what was and was not done (Quality) and leads with the result (Quantity, Manner). See [`evals/README.md`](evals/README.md#agentic-cases).
 
 ## Limitations
 
 - The judge is a model and shares some of the biases it is meant to detect.
-- 26 prompts cover common cases, not every kind of conversation. Add cases from your own domain to `cases.jsonl`.
+- The case sets cover common cases, not every kind of conversation. Add cases from your own domain.
 - A good result on one model does not carry over automatically to another model. Re-run when you change models.
