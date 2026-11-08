@@ -7,7 +7,8 @@ Harness for the method in [../EVALUATION.md](../EVALUATION.md).
 | `cases.jsonl` | 26 test prompts: bait prompts per maxim and control prompts. Each has a `check`, one concrete pass/fail requirement. |
 | `cases-personas.jsonl` | 25 prompts for students, researchers, developers and product managers, adapted from published examples. Each records its `source`. |
 | `cases-agentic.jsonl` | 8 tasks the agent carries out in a small repo before it replies (claude-code backend only). Each names a `fixture` and lists the `facts` the judge needs. |
-| `fixtures/<name>/` | `repo/`, copied into a fresh git repo for every call, and `verify.sh`, a check the harness runs afterwards. The agent never sees `verify.sh`. |
+| `cases-agentic-hard.jsonl` | 6 harder agentic tasks: the problem is buried in long output, hidden by a re-run, in an untested caller, among minor review findings, in an unstated choice, or in data that needs cleaning. |
+| `fixtures/<name>/` | `repo/`, copied into a fresh git repo for every call; optional `setup.sh`, run after the first commit (for example to create a branch); and `verify.sh`, a check the harness runs afterwards. The agent never sees `verify.sh`. |
 | `run_eval.py` | Generates replies under `baseline`, `concise`, and `skill`, judges them blind, and writes the report. |
 | `results/<run-id>/` | Output of a run: `responses.jsonl`, `rubric.jsonl`, `pairwise.jsonl`, `report.md`, `examples.md`, `config.json`, and `progress.json` if the usage gate stopped it. |
 
@@ -27,6 +28,9 @@ python evals/run_eval.py all --backend claude-code --samples 1 \
 
 # Resume a stopped run (keeps its settings; raise the gate to approve more usage)
 python evals/run_eval.py all --run evals/results/<run-id> --usage-gate 0.40
+
+# Add samples to a finished run (existing samples are kept; only new ones run)
+python evals/run_eval.py all --run evals/results/<run-id> --samples 3
 ```
 
 Options: `--backend` (`api` or `claude-code`), `--model` (model under test, default `claude-opus-5-5`), `--judge-model`, `--effort` (default `medium`), `--samples`, `--conditions`, `--cases`, `--workers`, `--usage-gate`, `--usage-window`, `--timeout`.
