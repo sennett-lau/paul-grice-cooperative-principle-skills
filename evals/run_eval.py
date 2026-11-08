@@ -29,6 +29,7 @@ progress.json and exits with code 3.
 import argparse
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -189,6 +190,12 @@ class ClaudeCodeBackend:
         git = ["git", "-c", "user.name=Eval", "-c", "user.email=eval@example.com"]
         for c in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-qm", "Initial commit"]):
             subprocess.run(git + c, cwd=d, check=True, capture_output=True)
+        setup = FIXTURES_DIR / fixture / "setup.sh"
+        if setup.exists():  # e.g. create a feature branch; gets the fixture dir as $1
+            subprocess.run(["sh", str(setup), str(FIXTURES_DIR / fixture)], cwd=d, check=True,
+                           capture_output=True, env={**os.environ, "GIT_AUTHOR_NAME": "Eval",
+                           "GIT_AUTHOR_EMAIL": "eval@example.com", "GIT_COMMITTER_NAME": "Eval",
+                           "GIT_COMMITTER_EMAIL": "eval@example.com"})
         return d
 
     def ask(self, model, prompt, append="", schema=None, plugin=False, claude_md=None, fixture=None) -> dict:
@@ -604,7 +611,8 @@ def main() -> None:
     p.add_argument("--judge-model", default="claude-opus-5-5",
                    help="judge model; prefer a different model from --model to limit self-preference")
     p.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
-    p.add_argument("--samples", type=int, default=3, help="replies per case and condition")
+    p.add_argument("--samples", type=int, default=None,
+                   help="replies per case and condition (default 3); when resuming, a higher value adds samples")
     p.add_argument("--conditions", default=None,
                    help="comma-separated: baseline,concise,skill,plugin,pointer "
                         "(default: baseline,concise,skill; plugin and pointer need claude-code)")
@@ -623,9 +631,15 @@ def main() -> None:
     config_path = run_dir / "config.json"
     if config_path.exists():  # resuming: keep the run's original settings
         saved = json.loads(config_path.read_text())
+        extra_samples = args.samples if args.samples and args.samples > saved["samples"] else None
         for k in ("backend", "model", "judge_model", "effort", "samples", "conditions", "cases", "cases_file"):
             setattr(args, k, saved.get(k))
+        if extra_samples:  # existing samples are kept; only the new ones are generated and judged
+            args.samples = saved["samples"] = extra_samples
+            config_path.write_text(json.dumps(saved, indent=2))
+            log(f"resume: raised samples to {extra_samples}")
     else:
+        args.samples = args.samples or 3
         args.conditions = (args.conditions or "baseline,concise,skill").split(",")
         config_path.write_text(json.dumps(
             {k: getattr(args, k) for k in ("backend", "model", "judge_model", "effort", "samples", "conditions", "cases", "cases_file")},
