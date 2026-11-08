@@ -1,5 +1,3 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
-
 # Paul Grice Cooperative Principle Skills
 
 An agent skill that makes an agent talk the way Paul Grice described cooperative conversation: say what is needed, say only what is true, stay relevant, and be clear.
