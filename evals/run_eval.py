@@ -13,11 +13,19 @@ Backends:
   claude-code  Headless `claude -p`, using your Claude login. Baseline is Claude
                Code's own system prompt; user/project settings, hooks, CLAUDE.md
                and MCP servers are switched off.
+  codex        Headless `codex exec`, using your ChatGPT login. Default model
+               gpt-6-luna (fast and cheap) at --effort medium. Runs with a
+               temporary CODEX_HOME and HOME, so your ~/.codex/AGENTS.md, config
+               and ~/.agents/skills are not loaded; only Codex's built-in skills
+               are. auth.json is copied in for the run and copied back if Codex
+               refreshed it. Codex does not report plan usage, so the usage gate
+               does not apply; token counts are recorded instead.
 
-Agentic cases (a "fixture" field; claude-code only): each call gets a fresh git
+Agentic cases (a "fixture" field; claude-code and codex): each call gets a fresh git
 repo copied from evals/fixtures/<fixture>/repo and the tools Bash, Read, Edit,
 Write, Glob and Grep, with permission checks off and package installs and
-network commands denied. Afterwards the hidden evals/fixtures/<fixture>/verify.sh
+network commands denied (codex: the workspace-write sandbox, which has no
+network). Afterwards the hidden evals/fixtures/<fixture>/verify.sh
 runs in that repo, and its output goes to the judge with the case's "facts".
 
 Every result is appended to disk as soon as it arrives, so a stopped run can be
@@ -27,6 +35,7 @@ progress.json and exits with code 3.
 """
 
 import argparse
+import atexit
 import json
 import math
 import os
@@ -181,12 +190,12 @@ class ClaudeCodeBackend:
         return self.md_workdirs[claude_md]
 
     @staticmethod
-    def _fixture_repo(fixture: str, claude_md=None) -> str:
+    def _fixture_repo(fixture: str, claude_md=None, md_name: str = "CLAUDE.md") -> str:
         # A fresh git repo with one commit, copied from the fixture.
         d = tempfile.mkdtemp(prefix=f"grice-eval-{fixture}-")
         shutil.copytree(FIXTURES_DIR / fixture / "repo", d, dirs_exist_ok=True)
         if claude_md:
-            Path(d, "CLAUDE.md").write_text(claude_md)
+            Path(d, md_name).write_text(claude_md)
         git = ["git", "-c", "user.name=Eval", "-c", "user.email=eval@example.com"]
         for c in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-qm", "Initial commit"]):
             subprocess.run(git + c, cwd=d, check=True, capture_output=True)
@@ -257,6 +266,107 @@ class ClaudeCodeBackend:
                         out["stop_reason"] = "error: no structured output"
         if proc.returncode != 0 and not out["text"]:
             out["stop_reason"] = f"error: exit {proc.returncode}: {proc.stderr.strip()[:300]}"
+        if fixture:
+            v = subprocess.run(["sh", str(FIXTURES_DIR / fixture / "verify.sh")], cwd=workdir,
+                               capture_output=True, text=True, timeout=120)
+            out["verify"] = (v.stdout + v.stderr).strip()[:3000]
+            shutil.rmtree(workdir, ignore_errors=True)
+        return out
+
+
+class CodexBackend:
+    """Headless `codex exec`. Conditions map to Codex like this: "append" goes into
+    developer_instructions; "plugin" installs the skill in ~/.agents/skills (of the
+    temporary HOME); "pointer" also writes the pointer line to AGENTS.md."""
+    name = "codex"
+
+    def __init__(self, effort: str, timeout: int = 600):
+        self.effort, self.timeout = effort, timeout
+        self.codex_home = tempfile.mkdtemp(prefix="grice-codex-home-")
+        self.real_auth = Path.home() / ".codex" / "auth.json"
+        self.auth_snapshot = self.real_auth.read_bytes()
+        Path(self.codex_home, "auth.json").write_bytes(self.auth_snapshot)
+        os.chmod(Path(self.codex_home, "auth.json"), 0o600)
+        self.home_clean = tempfile.mkdtemp(prefix="grice-codex-clean-")
+        self.home_skill = tempfile.mkdtemp(prefix="grice-codex-skill-")
+        shutil.copytree(SKILL_FILE.parent, Path(self.home_skill, ".agents", "skills", "cooperative-principle"))
+        self.workdir = tempfile.mkdtemp(prefix="grice-codex-")
+        self.md_workdirs = {}
+        atexit.register(self.cleanup)
+
+    def cleanup(self) -> None:
+        # Keep a refreshed login: copy auth.json back, unless the real one changed meanwhile.
+        tmp_auth = Path(self.codex_home, "auth.json")
+        if (tmp_auth.exists() and tmp_auth.read_bytes() != self.auth_snapshot
+                and self.real_auth.read_bytes() == self.auth_snapshot):
+            self.real_auth.write_bytes(tmp_auth.read_bytes())
+        for d in (self.codex_home, self.home_clean, self.home_skill, self.workdir, *self.md_workdirs.values()):
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _workdir_with(self, agents_md: str) -> str:
+        if agents_md not in self.md_workdirs:
+            d = tempfile.mkdtemp(prefix="grice-codex-md-")
+            Path(d, "AGENTS.md").write_text(agents_md)
+            self.md_workdirs[agents_md] = d
+        return self.md_workdirs[agents_md]
+
+    def ask(self, model, prompt, append="", schema=None, plugin=False, claude_md=None, fixture=None) -> dict:
+        if fixture:
+            workdir = ClaudeCodeBackend._fixture_repo(fixture, claude_md, md_name="AGENTS.md")
+        else:
+            workdir = self._workdir_with(claude_md) if claude_md else self.workdir
+        last = Path(tempfile.mkstemp(prefix="grice-codex-last-", suffix=".txt")[1])
+        cmd = ["codex", "exec", "--ignore-user-config", "--skip-git-repo-check", "--ephemeral",
+               "-s", "workspace-write" if fixture else "read-only", "-m", model,
+               "-c", f'model_reasoning_effort="{self.effort}"', "--json", "-o", str(last)]
+        if append:
+            cmd += ["-c", "developer_instructions=" + json.dumps(append)]  # a JSON string is a valid TOML string
+        schema_file = None
+        if schema is not None:
+            schema_file = Path(tempfile.mkstemp(prefix="grice-codex-schema-", suffix=".json")[1])
+            schema_file.write_text(json.dumps(schema))
+            cmd += ["--output-schema", str(schema_file)]
+        cmd.append(prompt)
+        env = {**os.environ, "CODEX_HOME": self.codex_home, "HOME": self.home_skill if plugin else self.home_clean}
+        out = {"text": "", "stop_reason": "error: no result", "skill_invoked": False, "trace": []}
+        try:
+            proc = subprocess.run(cmd, cwd=workdir, env=env, stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            proc = None
+            out["stop_reason"] = "error: timeout"
+        if proc is not None:
+            tokens = 0
+            for line in proc.stdout.splitlines():
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                item = o.get("item") or {}
+                if o.get("type") == "item.completed" and item.get("type") == "command_execution":
+                    command = str(item.get("command", ""))
+                    out["trace"].append(f"shell: {command[:200]}")
+                    if "cooperative-principle" in command and "SKILL.md" in command:
+                        out["skill_invoked"] = True
+                elif o.get("type") == "turn.completed":
+                    u = o.get("usage") or {}
+                    tokens += u.get("input_tokens", 0) + u.get("output_tokens", 0)
+                elif o.get("type") in ("turn.failed", "error"):
+                    out["stop_reason"] = f"error: {json.dumps(o)[:300]}"
+            out["tokens"] = tokens
+            text = last.read_text().strip() if last.exists() else ""
+            if text:
+                out["text"], out["stop_reason"] = text, "end_turn"
+                if schema is not None:
+                    try:
+                        out["structured"] = json.loads(text)
+                    except json.JSONDecodeError:
+                        out["stop_reason"] = "error: invalid JSON"
+            elif proc.returncode != 0:
+                out["stop_reason"] = f"error: exit {proc.returncode}: {proc.stderr.strip()[-300:]}"
+        last.unlink(missing_ok=True)
+        if schema_file:
+            schema_file.unlink(missing_ok=True)
         if fixture:
             v = subprocess.run(["sh", str(FIXTURES_DIR / fixture / "verify.sh")], cwd=workdir,
                                capture_output=True, text=True, timeout=120)
@@ -351,7 +461,7 @@ def generate(args, backend, gate, run_dir: Path) -> None:
                         plugin=setup.get("plugin", False), claude_md=setup.get("claude_md"),
                         fixture=job.get("fixture"))
         return {**job, "reply": r["text"], "stop_reason": r["stop_reason"],
-                "skill_invoked": r.get("skill_invoked"), "cost_usd": r.get("cost_usd"),
+                "skill_invoked": r.get("skill_invoked"), "cost_usd": r.get("cost_usd"), "tokens": r.get("tokens"),
                 "trace": r.get("trace") or None, "verify": r.get("verify")}
 
     key = lambda r: (r["id"], r["condition"], r["sample"])
@@ -568,6 +678,9 @@ def report(args, run_dir: Path) -> None:
     costs = [r.get("cost_usd") for r in read_jsonl(run_dir / "responses.jsonl") if r.get("cost_usd")]
     if costs:
         out.extend([f"Generation cost reported by Claude Code (API-equivalent): ${sum(costs):.2f}", ""])
+    tokens = [r.get("tokens") for r in read_jsonl(run_dir / "responses.jsonl") if r.get("tokens")]
+    if tokens:
+        out.extend([f"Generation tokens reported by Codex (input + output): {sum(tokens):,}", ""])
 
     (run_dir / "report.md").write_text("\n".join(out))
     print("\n".join(out))
@@ -606,23 +719,24 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("stage", choices=["generate", "judge", "report", "all"])
     p.add_argument("--run", help="run directory; pass an existing one to resume")
-    p.add_argument("--backend", choices=["api", "claude-code"], default="api")
-    p.add_argument("--model", default="claude-opus-5-5", help="model under test")
-    p.add_argument("--judge-model", default="claude-opus-5-5",
-                   help="judge model; prefer a different model from --model to limit self-preference")
+    p.add_argument("--backend", choices=["api", "claude-code", "codex"], default="api")
+    p.add_argument("--model", default=None,
+                   help="model under test (default: claude-opus-5-5; gpt-6-luna for codex)")
+    p.add_argument("--judge-model", default=None,
+                   help="judge model (default: same as --model); prefer a different model to limit self-preference")
     p.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
     p.add_argument("--samples", type=int, default=None,
                    help="replies per case and condition (default 3); when resuming, a higher value adds samples")
     p.add_argument("--conditions", default=None,
                    help="comma-separated: baseline,concise,skill,plugin,pointer "
-                        "(default: baseline,concise,skill; plugin and pointer need claude-code)")
+                        "(default: baseline,concise,skill; plugin and pointer need claude-code or codex)")
     p.add_argument("--cases-file", default=None, help="JSONL test cases (default: evals/cases.jsonl)")
     p.add_argument("--cases", help="comma-separated case ids or maxims to run (default: all)")
     p.add_argument("--workers", type=int, default=None,
-                   help="parallel calls (default: 4 for api, 2 for claude-code)")
+                   help="parallel calls (default: 4 for api, 2 for claude-code and codex)")
     p.add_argument("--usage-gate", type=float, default=0.20,
                    help="claude-code: stop starting new calls when the usage window reaches this fraction")
-    p.add_argument("--timeout", type=int, default=300, help="claude-code: seconds per call")
+    p.add_argument("--timeout", type=int, default=300, help="claude-code and codex: seconds per call")
     p.add_argument("--usage-window", choices=["five_hour", "seven_day"], default="five_hour")
     args = p.parse_args()
 
@@ -640,6 +754,8 @@ def main() -> None:
             log(f"resume: raised samples to {extra_samples}")
     else:
         args.samples = args.samples or 3
+        args.model = args.model or ("gpt-6-luna" if args.backend == "codex" else "claude-opus-5-5")
+        args.judge_model = args.judge_model or args.model
         args.conditions = (args.conditions or "baseline,concise,skill").split(",")
         config_path.write_text(json.dumps(
             {k: getattr(args, k) for k in ("backend", "model", "judge_model", "effort", "samples", "conditions", "cases", "cases_file")},
@@ -649,7 +765,9 @@ def main() -> None:
 
     gate = UsageGate(args.usage_gate, args.usage_window)
     if args.stage != "report":
-        backend = ApiBackend(args.effort) if args.backend == "api" else ClaudeCodeBackend(args.effort, gate, args.timeout)
+        backend = (ApiBackend(args.effort) if args.backend == "api" else
+                   CodexBackend(args.effort, args.timeout) if args.backend == "codex" else
+                   ClaudeCodeBackend(args.effort, gate, args.timeout))
     if args.stage in ("generate", "all"):
         generate(args, backend, gate, run_dir)
     if args.stage in ("judge", "all"):
